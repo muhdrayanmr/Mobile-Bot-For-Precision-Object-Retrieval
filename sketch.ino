@@ -1,7 +1,12 @@
+/*
+ NodeMCU (ESP8266) Integrated Script with Claw Support
+*/
+
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
 
-// --- PINS ---
+// Pins
 #define IR_L D5
 #define IR_R D7
 #define TRIG D6
@@ -12,19 +17,27 @@
 #define B2 D8
 #define EN D0
 
-// --- SETTINGS ---
-int normalSpeed = 50;
-int slowSpeed = 20;
+// Arduino Uno Comm Pins
+#define CLAW_TRIG 3 // RX pin (GPIO 3) -> Triggers Uno to grab
+#define CLAW_DONE 1 // TX pin (GPIO 1) -> Listens for Uno to finish
+
+// Settings
+int normalSpeed = 120; 
+int slowSpeed = 90;   
 const int TURN_MS = 160;
 const int BACK_MS = 200;
 
 const char *ssid = "Ryan";
 const char *password = "24274908";
 ESP8266WebServer server(80);
+WiFiUDP udp;
 
-// --- STATE ---
+// State Variables
 String current_nav = "stop";
 bool target_visible = false;
+enum SystemState { EMPTY, HOLDING, DONE };
+SystemState sys_state = EMPTY;
+unsigned long last_cmd_time = 0; 
 
 void setup()
 {
@@ -40,83 +53,131 @@ void setup()
     analogWriteRange(255);
     analogWriteFreq(1000);
 
-    Serial.begin(115200); // Set Serial Monitor to 115200 baud
-
     WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED)
-    {
-        delay(500);
-        Serial.print(".");
-    }
+    
+    // Start UDP for Python Auto-Discovery
+    udp.begin(4210);
 
-    Serial.println("\nConnected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP()); // Look at this in Serial Monitor for Python!
+    // Setup Claw Pins
+    pinMode(CLAW_TRIG, OUTPUT);
+    digitalWrite(CLAW_TRIG, HIGH);   
+    pinMode(CLAW_DONE, INPUT_PULLUP);
 
-    server.on("/forward", []()
-              { current_nav = "forward"; target_visible = true; server.send(200); });
-    server.on("/left", []()
-              { current_nav = "left";    target_visible = true; server.send(200); });
-    server.on("/right", []()
-              { current_nav = "right";   target_visible = true; server.send(200); });
-    server.on("/stop", []()
-              { current_nav = "stop";    target_visible = false; server.send(200); });
+    auto get_state_str = []() { return sys_state == EMPTY ? "empty" : (sys_state == HOLDING ? "holding" : "done"); };
+    server.on("/forward", [get_state_str]() { current_nav = "forward"; target_visible = true; last_cmd_time = millis(); server.send(200, "text/plain", get_state_str()); });
+    server.on("/left", [get_state_str]()    { current_nav = "left";    target_visible = true; last_cmd_time = millis(); server.send(200, "text/plain", get_state_str()); });
+    server.on("/right", [get_state_str]()   { current_nav = "right";   target_visible = true; last_cmd_time = millis(); server.send(200, "text/plain", get_state_str()); });
+    server.on("/spin", [get_state_str]()    { current_nav = "spin";    target_visible = true; last_cmd_time = millis(); server.send(200, "text/plain", get_state_str()); });
+    server.on("/stop", [get_state_str]()    { current_nav = "stop";    target_visible = false; last_cmd_time = millis(); server.send(200, "text/plain", get_state_str()); });
 
     server.begin();
 }
 
 void loop()
 {
-    server.handleClient();
+    server.handleClient(); 
     yield();
+
+    if (target_visible && (millis() - last_cmd_time > 1000)) {
+        target_visible = false;
+        current_nav = "stop";
+        stopMotors();
+    }
+
+    static unsigned long last_broadcast = 0;
+    if (WiFi.status() == WL_CONNECTED && millis() - last_broadcast > 2000) {
+        last_broadcast = millis();
+        udp.beginPacket(IPAddress(255, 255, 255, 255), 4210);
+        udp.print("NITC_BOT_IP:");
+        udp.print(WiFi.localIP().toString());
+        udp.endPacket();
+    }
 
     float dist = getDistance();
     int left = digitalRead(IR_L);
     int right = digitalRead(IR_R);
 
+    if (sys_state == DONE) {
+        stopMotors();
+        return;
+    }
+
     if (target_visible)
     {
-        // --- VISION MODE ---
-        if (dist < 10 && dist > 1)
+        if (dist < 10 && dist > 1 && current_nav != "spin")
         {
             stopMotors();
+            
+            if (sys_state == EMPTY) {
+                // Fire claw trigger to Uno for Pickup
+                digitalWrite(CLAW_TRIG, LOW);
+                delay(200);
+                digitalWrite(CLAW_TRIG, HIGH);
+
+                // Wait up to 10 seconds for Uno to pull DONE line LOW
+                unsigned long wait_start = millis();
+                while (digitalRead(CLAW_DONE) == HIGH && (millis() - wait_start < 10000))
+                {
+                    server.handleClient(); 
+                    yield();               
+                }
+                sys_state = HOLDING;
+                current_nav = "stop";
+                target_visible = false; // Temporarily stop tracking to allow Python to sync
+            } else if (sys_state == HOLDING) {
+                // Fire claw trigger to Uno for Drop-off
+                digitalWrite(CLAW_TRIG, LOW);
+                delay(200);
+                digitalWrite(CLAW_TRIG, HIGH);
+
+                // Wait up to 10 seconds for Uno to pull DONE line LOW
+                unsigned long wait_start = millis();
+                while (digitalRead(CLAW_DONE) == HIGH && (millis() - wait_start < 10000))
+                {
+                    server.handleClient(); 
+                    yield();               
+                }
+                sys_state = DONE;
+                current_nav = "stop";
+                target_visible = false;
+            }
         }
         else
         {
             int speed = (dist < 25) ? slowSpeed : normalSpeed;
-            if (current_nav == "forward")
-                forward(speed);
-            else if (current_nav == "left")
-                softLeft(speed);
-            else if (current_nav == "right")
-                softRight(speed);
-            else
-                stopMotors();
+            int turnSpeed = 85; // Slower turn speed for fine alignment
+            if (current_nav == "forward")  forward(speed);
+            else if (current_nav == "left") softLeft(turnSpeed);
+            else if (current_nav == "right") softRight(turnSpeed);
+            else if (current_nav == "spin") spinRight(turnSpeed);
+            else stopMotors();
         }
     }
     else
     {
-        // --- NATIVE ROAMER MODE (Obstacle Detection) ---
-        if (dist < 15)
+        if (sys_state == HOLDING) {
+            stopMotors(); // Wait safely for vision.py to send the spin sweep command
+        }
+        else if (dist < 15 || (left == LOW && right == LOW))
         {
             backward();
             delay(BACK_MS);
-            if (left == LOW)
-                softRight(normalSpeed);
-            else
-                softLeft(normalSpeed);
+            if (left == LOW) softRight(normalSpeed);
+            else softLeft(normalSpeed);
             delay(TURN_MS);
         }
-        else if (left == LOW && right == HIGH)
-            softRight(slowSpeed);
-        else if (right == LOW && left == HIGH)
-            softLeft(slowSpeed);
+        else if (left == LOW) {
+            softRight(normalSpeed);
+            delay(100);
+        }
+        else if (right == LOW) {
+            softLeft(normalSpeed);
+            delay(100);
+        }
         else
             forward(normalSpeed);
     }
 }
-
-// --- FULL MOTOR FUNCTIONS ---
 
 void forward(int spd)
 {
@@ -129,7 +190,7 @@ void forward(int spd)
 
 void backward()
 {
-    analogWrite(EN, 150); // Set fixed speed for backing up
+    analogWrite(EN, 150); 
     digitalWrite(A1, HIGH);
     digitalWrite(A2, LOW);
     digitalWrite(B1, HIGH);
@@ -142,14 +203,14 @@ void softRight(int spd)
     digitalWrite(A1, LOW);
     digitalWrite(A2, HIGH);
     digitalWrite(B1, LOW);
-    digitalWrite(B2, LOW); // Motor B stops
+    digitalWrite(B2, LOW); 
 }
 
 void softLeft(int spd)
 {
     analogWrite(EN, spd);
     digitalWrite(A1, LOW);
-    digitalWrite(A2, LOW); // Motor A stops
+    digitalWrite(A2, LOW); 
     digitalWrite(B1, LOW);
     digitalWrite(B2, HIGH);
 }
@@ -160,6 +221,15 @@ void stopMotors()
     digitalWrite(A1, LOW);
     digitalWrite(A2, LOW);
     digitalWrite(B1, LOW);
+    digitalWrite(B2, LOW);
+}
+
+void spinRight(int spd)
+{
+    analogWrite(EN, spd);
+    digitalWrite(A1, LOW);
+    digitalWrite(A2, HIGH);
+    digitalWrite(B1, HIGH);
     digitalWrite(B2, LOW);
 }
 
