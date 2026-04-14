@@ -14,6 +14,8 @@ def pick_color(event, x, y, flags, param):
             # Get the HSV value at the clicked coordinate
             # Note: y is row, x is column
             h, s, v = hsv_frame[y, x]
+            # Convert to int to prevent uint8 underflow
+            h, s, v = int(h), int(s), int(v)
             
             # Create a range
             h_min, h_max = np.clip([h-10, h+10], 0, 180)
@@ -35,12 +37,13 @@ cv2.namedWindow("Bot Control")
 cv2.setMouseCallback("Bot Control", pick_color)
 
 # 2. Create Trackbars on the "Controls" window
+# Start with all 0s so mask is black instead of full white, until user double clicks
 cv2.createTrackbar("H Min", "Controls", 0, 180, nothing)
-cv2.createTrackbar("H Max", "Controls", 180, 180, nothing)
+cv2.createTrackbar("H Max", "Controls", 0, 180, nothing)
 cv2.createTrackbar("S Min", "Controls", 0, 255, nothing)
-cv2.createTrackbar("S Max", "Controls", 255, 255, nothing)
+cv2.createTrackbar("S Max", "Controls", 0, 255, nothing)
 cv2.createTrackbar("V Min", "Controls", 0, 255, nothing)
-cv2.createTrackbar("V Max", "Controls", 255, 255, nothing)
+cv2.createTrackbar("V Max", "Controls", 0, 255, nothing)
 
 cap = cv2.VideoCapture(1)
 
