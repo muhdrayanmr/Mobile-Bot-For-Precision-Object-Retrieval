@@ -3,7 +3,7 @@ National Institute Of Technology Calicut (NITC) . The aim of the project is to b
 detection and drops it off at fixed drop point.
 
 Team Members:
-Muhammad Rayan M R
-Rishabh Darpan Sheth
-Niranjan A
+Muhammad Rayan M R <br>
+Rishabh Darpan Sheth<br>
+Niranjan A<br>
 Kadhirnilan Thirumaran
